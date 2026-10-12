@@ -38,7 +38,7 @@ def parse_args(argv=None):
     parser.add_argument('-st_lambda_feature', type=float, default=0.1, help='ST-SAT: Soft-feature distillation coefficient for penultimate layer')
     parser.add_argument('-st_exist_label_weight', type=float, default=0.3, help='ST-SAT: Weight for existing labels in adaptive distillation (lower for regularization)')
     parser.add_argument('-st_no_exist_label_weight', type=float, default=1.0, help='ST-SAT: Weight for non-existing labels in adaptive distillation')
-    parser.add_argument('-st_kd_grad_weighting', '--st-kd-grad-weighting', choices=('none', 'cosine'), default='none',
+    parser.add_argument('-st_kd_grad_weighting', '--st-kd-grad-weighting', choices=('none', 'cosine'), default='cosine',
                         help='ST-SAT: none keeps fixed KD coefficients; cosine applies detached CE-gradient cosine gates in [0, 1] to existing-class and soft-feature KD')
     parser.add_argument('-st_temporal_momentum', type=float, default=1.0, help='ST-SAT: Server temporal interpolation weight (0=keep old server value, 1=client weighted average); no persistent local parameters')
     parser.add_argument('-st_decay_momentum', type=float, default=1.0, help='ST-SAT: Server tau interpolation weight (0=keep old server value, 1=client weighted average); interpolation is in tau/logit space')
