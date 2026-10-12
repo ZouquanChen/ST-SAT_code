@@ -16,6 +16,44 @@ pandas==1.5.3
 spikingjelly==0.0.0.0.14
 ```
 
+## KD Gradient Weighting
+
+`-st_kd_grad_weighting` (also `--st-kd-grad-weighting`) selects `none` or `cosine`.
+The default is `none`, which preserves the original fixed-weight loss and its
+addition order. Enable cosine weighting with:
+
+```powershell
+python main.py -data_dir PATH_TO_CIFAR10 -st_kd_grad_weighting cosine
+```
+
+With the default KD coefficients, the losses are:
+
+```text
+none:   CE + Reg + 0.1 * MissingKD + 0.03 * ExistingKD + 0.1 * FeatureMSE
+cosine: CE + Reg + 0.1 * MissingKD + 0.03 * existing_gate * ExistingKD
+                + 0.1 * feature_gate * FeatureMSE
+```
+
+The two gates are computed independently for each minibatch as the detached
+cosine between pure CE gradients and the corresponding scaled KD gradients,
+clipped to `[0, 1]`. All trainable parameters, including the final classifier,
+are included; unused gradients count as zero. Conflicting or zero gradients
+receive a zero gate. Disabled KD terms skip their gradient probes.
+Missing-class KD and regularization retain their original coefficients.
+Feature KD is scaled by `st_lambda_feature` only, without an extra `lamda`.
+
+The constraint guarantees a nonnegative full-model gradient inner product with
+CE for each gated term. It is not a per-layer guarantee or a guarantee about
+the actual Adam/momentum update.
+
+Each local epoch logs `mode`, `existing_gate`, `feature_gate`, and
+`effective_distill` (the minibatch mean of KD after all coefficients and gates).
+The existing `Distill` field retains its original unscaled meaning.
+BN behavior, neuron settings, and aggregation momenta retain their existing
+defaults. Changing this option takes effect when a new training process starts.
+
+Run the checks with `python -m unittest test_kd_weighting -v`.
+
 ## Acknowledgements
 
 This work is built upon the following papers:

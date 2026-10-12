@@ -4,4 +4,3 @@ __pycache__/
 data/
 logs/
 saved/
-/config.py
