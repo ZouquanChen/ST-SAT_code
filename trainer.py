@@ -11,7 +11,6 @@ import torch.optim as optim
 from utils import CLASS_NUM, INPUT_SIZE, Logger, load_data, get_dataloader, compute_accuracy, ensure_dir
 from sampler import partition_data
 from models.vgg_stlif import VGG_STLIF, get_all_lifact_params, get_lifact_temporal_info, compute_st_regularization
-from models.kd_weighting import stsat_distillation_loss
 
 def init_nets(n_parties, args):
     nets = {i: VGG_STLIF(args) for i in range(n_parties)}
@@ -30,6 +29,9 @@ def summarize_client_best_accuracy(client_best_accuracy):
     return {'average_best_client_accuracy': float(np.mean(valid)) if valid else None, 'num_clients_evaluated': len(valid), 'client_best_accuracy': {str(client_id): None if value < 0.0 else float(value) for (client_id, value) in sorted(client_best_accuracy.items())}}
 
 def run(args):
+    dynamic_distillation = args.st_distill_mode == 'dynamic_b'
+    if dynamic_distillation:
+        from models.kd_weighting import stsat_distillation_loss
     args.num_classes = CLASS_NUM[args.dataset]
     args.device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
     if args.device.type != 'cpu':
@@ -71,6 +73,8 @@ def run(args):
     global_acc_record = []
     best_global_param = None
     run_tag = f'alpha{args.alpha:g}_seed{args.init_seed}_np{args.n_parties}_frac{args.frac:g}'
+    if dynamic_distillation:
+        run_tag += '_dynamic_b'
     from models.st_lif import LIFAct, validate_st_snn_model
     from spikingjelly.activation_based import functional
     (nets, local_model_meta_data, layer_type) = init_nets(args.n_parties, args)
@@ -85,7 +89,7 @@ def run(args):
     global_model.to(device)
     logger.info('=' * 80)
     logger.info('ST-SATH (Spatio-Temporal PLIF) Configuration with Enhanced Knowledge Distillation:')
-    logger.info(f'[ST-SATH KD] mode={args.st_kd_grad_weighting}; existing-class and feature gates in [0, 1]; all trainable parameters')
+    logger.info(f'[ST-SATH Distillation] mode={args.st_distill_mode}')
     max_acc = -1.0
     best_epoch = 0
     client_best_acc = {i: -1.0 for i in range(args.n_parties)}
@@ -116,7 +120,8 @@ def run(args):
             no_exist_label = no_exist_label.clone().detach().int().to(device)
             exist_label = exist_label.clone().detach().int().to(device)
             (lifact_params, other_params) = get_all_lifact_params(net)
-            kd_parameters = tuple(p for p in net.parameters() if p.requires_grad)
+            if dynamic_distillation:
+                kd_parameters = tuple(p for p in net.parameters() if p.requires_grad)
             if args.optimizer == 'adam':
                 optimizer = optim.Adam([{'params': other_params, 'lr': args.lr}, {'params': lifact_params, 'lr': args.lr}], weight_decay=args.weight_decay)
             elif args.optimizer == 'sgd':
@@ -150,8 +155,8 @@ def run(args):
                 epoch_loss_collector = []
                 epoch_reg_loss_collector = []
                 epoch_distill_loss_collector = []
-                epoch_effective_kd_collector = []
-                epoch_kd_weight_sum = torch.zeros(2, device=device)
+                if dynamic_distillation:
+                    epoch_gate_sum = torch.zeros(2, device=device)
                 for (x, target) in train_dl_local:
                     (x, target) = (x.to(device), target.to(device))
                     optimizer.zero_grad()
@@ -180,41 +185,36 @@ def run(args):
                         l_feature = nn.functional.mse_loss(local_features, global_features)
                     else:
                         l_feature = torch.tensor(0.0, device=device)
-                    if args.st_kd_grad_weighting == 'none':
-                        # Preserve the original fixed-weight loss and addition order.
-                        kd_loss = l_ad * args.lamda + l_feature * args.st_lambda_feature
-                        kd_weights = {
-                            'existing': ce_loss.new_tensor(float(args.lamda * args.st_exist_label_weight > 0 and exist_label.numel() > 0)),
-                            'feature': ce_loss.new_tensor(float(args.st_lambda_feature > 0 and local_features is not None and global_features is not None)),
-                        }
-                        loss = ce_loss + reg_loss + l_ad * args.lamda + l_feature * args.st_lambda_feature
-                    else:
+                    if dynamic_distillation:
                         kd_loss, kd_weights = stsat_distillation_loss(
                             ce_loss, kl_per_class, no_exist_label, exist_label, l_feature,
                             kd_parameters, args.lamda, args.st_no_exist_label_weight,
                             args.st_exist_label_weight, args.st_lambda_feature,
-                            mode=args.st_kd_grad_weighting,
+                            mode='cosine', feature_reference='ce_missing_existing',
                         )
                         loss = ce_loss + reg_loss + kd_loss
+                    else:
+                        loss = ce_loss + reg_loss + l_ad * args.lamda + l_feature * args.st_lambda_feature
                     loss.backward()
                     optimizer.step()
                     epoch_loss_collector.append(ce_loss.item())
                     epoch_reg_loss_collector.append(reg_loss.item())
-                    epoch_distill_loss_collector.append(l_ad.item() + l_feature.item())
-                    epoch_effective_kd_collector.append(kd_loss.item())
-                    epoch_kd_weight_sum += torch.stack((kd_weights['existing'], kd_weights['feature']))
+                    if dynamic_distillation:
+                        epoch_distill_loss_collector.append(kd_loss.item())
+                        epoch_gate_sum += torch.stack((kd_weights['existing'], kd_weights['feature']))
+                    else:
+                        epoch_distill_loss_collector.append(l_ad.item() + l_feature.item())
                     neuron_total_samples += x.shape[1]
                     functional.reset_net(net)
                     functional.reset_net(global_model)
                 epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
                 epoch_reg = sum(epoch_reg_loss_collector) / len(epoch_reg_loss_collector)
                 epoch_distill = sum(epoch_distill_loss_collector) / len(epoch_distill_loss_collector)
-                mean_kd_weights = (epoch_kd_weight_sum / len(epoch_effective_kd_collector)).tolist()
-                effective_kd = sum(epoch_effective_kd_collector) / len(epoch_effective_kd_collector)
-                logger.info(f'[ST-SATH KD] client={net_id} local_epoch={l_epoch + 1} '
-                            f'mode={args.st_kd_grad_weighting} '
-                            f'existing_gate={mean_kd_weights[0]:.6f} feature_gate={mean_kd_weights[1]:.6f} '
-                            f'effective_distill={effective_kd:.6f}')
+                if dynamic_distillation:
+                    mean_gates = (epoch_gate_sum / len(epoch_loss_collector)).tolist()
+                    logger.info(f'[ST-SATH KD] mode=dynamic_b client={net_id} local_epoch={l_epoch + 1} '
+                                f'existing_gate={mean_gates[0]:.6f} feature_gate={mean_gates[1]:.6f} '
+                                f'effective_distill={epoch_distill:.6f}')
                 if (1 + l_epoch) % 5 == 0:
                     logger.info(f'Local Epoch [{1 + l_epoch}/{args.local_epochs}] - CE Loss: {epoch_loss:.4f}, Reg: {epoch_reg:.6f}, Distill: {epoch_distill:.6f}, Time: {time.time() - local_start_time:.2f}s')
             for hook in hooks:
@@ -308,7 +308,7 @@ def run(args):
     best_epoch_value = int(best_epoch)
     metrics_path = checkpoint_path[:-3] + '_metrics.json'
     with open(metrics_path, 'w', encoding='utf-8') as metrics_file:
-        json.dump({'strategy': args.strategy, 'dataset': args.dataset, 'model': args.model, 'alpha': args.alpha, 'seed': args.init_seed, 'run_tag': run_tag, 'best_global_accuracy': best_acc_value, 'best_global_epoch': best_epoch_value, 'global_test_samples': len(test_ds_global), 'global_test_policy': 'single_clean', **client_best_summary}, metrics_file, indent=2, ensure_ascii=False)
+        json.dump({'strategy': args.strategy, 'distillation_mode': args.st_distill_mode, 'dataset': args.dataset, 'model': args.model, 'alpha': args.alpha, 'seed': args.init_seed, 'run_tag': run_tag, 'best_global_accuracy': best_acc_value, 'best_global_epoch': best_epoch_value, 'global_test_samples': len(test_ds_global), 'global_test_policy': 'single_clean', **client_best_summary}, metrics_file, indent=2, ensure_ascii=False)
     logger.info(f"[{args.strategy}] Average best client accuracy: {client_best_summary['average_best_client_accuracy']} ({client_best_summary['num_clients_evaluated']} clients)")
     logger.info(f'Best global checkpoint saved to: {checkpoint_path}')
     logger.info(f'Metrics saved to: {metrics_path}')

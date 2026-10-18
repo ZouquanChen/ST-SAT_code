@@ -7,12 +7,12 @@ import torch
 def ce_aligned_kd_weights(ce_loss, objectives, parameters, mode='cosine'):
     """Return scalar gates in [0, 1] without modifying parameter .grad buffers.
 
-    Each objective is the already-scaled KD loss. The reference is pure CE,
+    Each objective is the unscaled KD loss. The reference is pure CE,
     over ALL trainable parameters, with unused gradients treated as zero.
     w_i = stop_gradient(clamp(cos(g_CE, g_i), 0, 1)). Therefore
     <g_CE, w_i*g_i> >= 0; this is a global first-order gradient constraint,
     not a per-layer constraint or a guarantee about an Adam/momentum step.
-    Zero CE/KD gradients receive zero weight. 'none' restores fixed weights.
+    Zero CE/KD gradients receive zero weight. 'none' uses unit gates.
     """
     if mode not in ('cosine', 'none'):
         raise ValueError('KD gradient weighting must be cosine or none')
@@ -55,27 +55,83 @@ def ce_aligned_kd_weights(ce_loss, objectives, parameters, mode='cosine'):
 
 def stsat_distillation_loss(ce_loss, kl_per_class, missing, existing, feature,
                             parameters, kd_weight, missing_weight, existing_weight,
-                            feature_weight, mode='cosine'):
-    """Keep missing-class KD fixed; gate existing-class KD and soft-feature KD.
+                            feature_weight, mode='cosine', regularization=None, feature_reference='ce', diagnostics=False, fixed_feature_weight=0.01):
+    """Use unit missing-class KD and cosine-only existing/feature KD weights.
 
     The original KL uses a full-class softmax, sliced only after computing KL.
-    Static nonnegative coefficients remain separate from the [0, 1] gates.
+    Legacy nonnegative coefficient arguments are enable switches: zero disables
+    a term, while any positive value enables it without scaling its loss.
+    kd_weight enables class KD; feature KD is enabled independently.
     Disabled/empty terms are omitted, including their gradient probes.
-    Returns (effective KD loss, {'existing': gate, 'feature': gate}).
+    'dual' takes min(CE cosine, complete-base cosine) for feature KD only.
+    Complete base = CE + missing KD + CE-gated existing KD + regularization.
+    All gates are detached. Regularization is referenced but NOT added to the
+    returned KD loss; callers add it exactly once. 'none' uses unit gates.
+    'fixed' uses fixed_feature_weight directly (no static outer coefficient
+    and no feature-gradient probes); feature_weight remains an enable switch.
+    Fixed-mode CE/base feature diagnostics are zero placeholders, not cosines.
+    'ce_missing' uses CE + unit missing KD; 'ce_missing_existing' adds the
+    actual detached CE-gated existing KD. Both use the reference cosine
+    directly, without a CE minimum and without referencing regularization.
+    In these modes feature_base records that selected reference gate.
+    Extra diagnostics report clipped cosines, reductions/amplifications
+    relative to CE, and detached raw/effective feature loss.
     """
-    coefficients = (kd_weight, missing_weight, existing_weight, feature_weight)
+    if feature_reference not in ('ce', 'dual', 'fixed', 'ce_missing', 'ce_missing_existing'):
+        raise ValueError('feature_reference must be ce, dual, fixed, ce_missing or ce_missing_existing')
+    parameters = tuple(parameters)
+    coefficients = (kd_weight, missing_weight, existing_weight, feature_weight, fixed_feature_weight)
     if any(not math.isfinite(value) or value < 0 for value in coefficients):
-        raise ValueError('KD coefficients must be finite and nonnegative')
+        raise ValueError('KD enable values must be finite and nonnegative')
     loss = ce_loss.new_zeros(())
-    if kd_weight * missing_weight > 0 and missing.numel():
-        loss = loss + kd_weight * missing_weight * kl_per_class[:, missing.long()].sum(1).mean()
+    if kd_weight > 0 and missing_weight > 0 and missing.numel():
+        loss = loss + kl_per_class[:, missing.long()].sum(1).mean()
+    missing_loss = loss
     objectives = {}
-    if kd_weight * existing_weight > 0 and existing.numel():
-        objectives['existing'] = kd_weight * existing_weight * kl_per_class[:, existing.long()].sum(1).mean()
+    if kd_weight > 0 and existing_weight > 0 and existing.numel():
+        objectives['existing'] = kl_per_class[:, existing.long()].sum(1).mean()
     if feature_weight > 0 and feature is not None and feature.requires_grad:
-        objectives['feature'] = feature_weight * feature
-    weights = ce_aligned_kd_weights(ce_loss, objectives, parameters, mode)
-    for name, objective in objectives.items():
-        loss = loss + weights[name] * objective
-    return loss, {name: weights.get(name, ce_loss.new_zeros(()))
-                  for name in ('existing', 'feature')}
+        objectives['feature'] = feature
+    # Fixed feature KD never probes feature gradients or applies a cosine gate.
+    gated_objectives = {k:v for k,v in objectives.items()
+                        if not (feature_reference == 'fixed' and k == 'feature')}
+    weights = ce_aligned_kd_weights(ce_loss, gated_objectives, parameters, mode)
+    if feature_reference == 'fixed' and 'feature' in objectives:
+        weights['feature'] = ce_loss.new_tensor(fixed_feature_weight).detach()
+    zero = ce_loss.new_zeros(())
+    # Existing-class KD stays CE-gated. Its detached gate belongs in the
+    # complete base reference, which excludes feature KD to avoid circularity.
+    if 'existing' in objectives:
+        loss = loss + weights['existing'] * objectives['existing']
+    feature_ce = weights.get('feature', zero) if feature_reference != 'fixed' else zero
+    feature_base = feature_ce
+    if feature_reference == 'dual' and mode == 'cosine' and 'feature' in objectives:
+        base = ce_loss + loss
+        if regularization is not None:
+            base = base + regularization
+        feature_base = ce_aligned_kd_weights(
+            base, {'feature': objectives['feature']}, parameters, mode)['feature']
+        weights['feature'] = torch.minimum(feature_ce, feature_base).detach()
+    if feature_reference in ('ce_missing', 'ce_missing_existing') and mode == 'cosine' and 'feature' in objectives:
+        # These references target classification and output KD only. The
+        # existing gate is CE-derived and detached; feature and regularizers
+        # must not be included in the reference (no self-alignment).
+        reference = ce_loss + (missing_loss if feature_reference == 'ce_missing' else loss)
+        feature_base = ce_aligned_kd_weights(
+            reference, {'feature': objectives['feature']}, parameters, mode)['feature']
+        weights['feature'] = feature_base.detach()  # DIRECT gate, no min with CE
+    if 'feature' in objectives:
+        loss = loss + weights['feature'] * objectives['feature']
+    feature_effective = weights.get('feature', zero)
+    result = {
+        'existing': weights.get('existing', zero), 'feature': feature_effective,
+        'feature_ce': feature_ce, 'feature_base': feature_base,
+        'feature_reduced': (feature_effective < feature_ce).to(ce_loss).detach(),
+        'feature_blocked_by_base': ((feature_ce > 0) & (feature_effective == 0)).to(ce_loss).detach(),
+        'feature_amplified': ((feature_effective > feature_ce) & (feature_reference != 'fixed')).to(ce_loss).detach(),
+        'feature_raw_loss': feature.detach() if 'feature' in objectives else zero,
+        'feature_weighted_loss': feature_effective * feature.detach() if 'feature' in objectives else zero,
+    }
+    if not diagnostics:
+        result = {name: result[name] for name in ('existing', 'feature')}
+    return loss, result
