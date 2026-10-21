@@ -1,5 +1,4 @@
-"""Verify original-B gates, fixed-default isolation and both training paths."""
-import hashlib
+"""Verify the dynamic-B-only strategy, gradients and training outputs."""
 import json
 import math
 from pathlib import Path
@@ -28,21 +27,22 @@ class DynamicBDistillationTests(unittest.TestCase):
         kl = torch.stack((3 * p[0] + 4 * p[1], 4 * p[1])).unsqueeze(0)
         return p, ce, kl, p[1]
 
-    def b_loss(self, ce, kl, feature, parameters, coefficients=(.1, 1., .3, .1), **kwargs):
+    def b_loss(self, ce, kl, feature, parameters, coefficients=(.1, 1., .3, .1)):
         return stsat_distillation_loss(
             ce, kl, torch.tensor([1]), torch.tensor([0]), feature, parameters,
-            *coefficients, mode='cosine', feature_reference='ce_missing_existing', **kwargs)
+            *coefficients)
 
-    def test_default_is_fixed_and_dynamic_mode_requires_selection(self):
-        self.assertEqual(parse_args([]).st_distill_mode, 'fixed')
+    def test_dynamic_b_is_the_only_mode_and_default(self):
+        self.assertEqual(parse_args([]).st_distill_mode, 'dynamic_b')
         self.assertEqual(parse_args(['-st_distill_mode', 'dynamic_b']).st_distill_mode, 'dynamic_b')
         self.assertEqual(parse_args(['--st-distill-mode', 'dynamic_b']).st_distill_mode, 'dynamic_b')
-        with patch('sys.stderr'), self.assertRaises(SystemExit):
-            parse_args(['-st_distill_mode', 'invalid'])
+        for mode in ('fixed', 'invalid'):
+            with self.subTest(mode=mode), patch('sys.stderr'), self.assertRaises(SystemExit):
+                parse_args(['-st_distill_mode', mode])
 
     def test_feature_uses_composite_reference_without_ce_minimum_or_regularization(self):
         p, ce, kl, feature = self.linear_losses()
-        kd, weights = self.b_loss(ce, kl, feature, [p], regularization=-100 * p[1])
+        kd, weights = self.b_loss(ce, kl, feature, [p])
         # CE=[1,0], existing=[3,4], missing=[0,4]; existing gate=.6.
         # The B reference gradient is [2.8,6.4], while CE/feature cosine is 0.
         feature_gate = 6.4 / math.sqrt(2.8 ** 2 + 6.4 ** 2)
@@ -61,8 +61,7 @@ class DynamicBDistillationTests(unittest.TestCase):
         kl = F.kl_div(p.log_softmax(1), teacher, reduction='none')
         feature = (p[:, :2] - .2).square().mean()
         kd, gates = stsat_distillation_loss(
-            ce, kl, torch.tensor([2]), torch.tensor([0, 1]), feature, [p], .1, 1., .3, .1,
-            mode='cosine', feature_reference='ce_missing_existing')
+            ce, kl, torch.tensor([2]), torch.tensor([0, 1]), feature, [p], .1, 1., .3, .1)
         grad = lambda loss: torch.autograd.grad(loss, p, retain_graph=True)[0]
         expected = (grad(ce) + grad(kl[:, 2].mean())
                     + gates['existing'] * grad(kl[:, :2].sum(1).mean())
@@ -85,7 +84,7 @@ class DynamicBDistillationTests(unittest.TestCase):
             kd, gates = self.b_loss(ce, kl, feature, [p], coefficients=(.1, .2, 0., 0.))
             empty_kd, empty_gates = stsat_distillation_loss(
                 ce, kl, torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), None,
-                [p], .1, 1., .3, .1, feature_reference='ce_missing_existing')
+                [p], .1, 1., .3, .1)
         torch.testing.assert_close(kd, kl[:, 1].mean(), rtol=0, atol=0)
         self.assertTrue(all(gate.item() == 0. for gate in gates.values()))
         self.assertEqual(empty_kd.item(), 0.)
@@ -110,61 +109,54 @@ class DynamicBDistillationTests(unittest.TestCase):
         gates = ce_aligned_kd_weights(shared * 0, {'existing': shared}, [shared])
         self.assertEqual(gates['existing'].item(), 0.)
 
-    def test_training_modes_save_separate_results_and_fixed_never_calls_dynamic_loss(self):
+    def test_parser_rejects_negative_and_nonfinite_kd_enable_values(self):
+        for flag in ('-lamda', '-st_no_exist_label_weight', '-st_exist_label_weight', '-st_lambda_feature'):
+            for value in ('-1', 'nan', 'inf'):
+                with self.subTest(flag=flag, value=value), patch('sys.stderr'), self.assertRaises(SystemExit):
+                    parse_args([flag, value])
+
+    def test_default_training_runs_dynamic_b_and_saves_results(self):
         import trainer
 
         dataset = torch.utils.data.TensorDataset(torch.randn(2, 3, 32, 32), torch.tensor([0, 1]))
         images = np.zeros((2, 32, 32, 3), dtype=np.uint8)
         labels = np.array([0, 1])
-        with tempfile.TemporaryDirectory(prefix='st_sat_two_modes_') as output:
-            fixed_hashes = {}
-            for mode in ('fixed', 'dynamic_b'):
-                with self.subTest(mode=mode):
-                    args = parse_args(['-gpu', '-1', '-np', '1', '-frac', '1', '-b', '2', '-T', '2',
-                                       '-global_epochs', '1', '-local_epochs', '2', '-result_dir', output,
-                                       '-st_distill_mode', mode])
-                    logger = Mock()
-                    with patch.multiple(trainer, Logger=Mock(return_value=logger),
-                                        load_data=Mock(return_value=(images, labels, images, labels)),
-                                        partition_data=Mock(return_value={0: [0, 1]}),
-                                        get_dataloader=Mock(return_value=(None, None, dataset, dataset)),
-                                        compute_accuracy=Mock(return_value=.5)), \
-                         patch('models.kd_weighting.stsat_distillation_loss', wraps=stsat_distillation_loss) as kd_call:
-                        trainer.run(args)
-                    if mode == 'fixed':
-                        kd_call.assert_not_called()
-                        fixed_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest()
-                                        for path in Path(output).iterdir()}
-                    else:
-                        self.assertEqual(kd_call.call_count, 2)
-                        for call in kd_call.call_args_list:
-                            self.assertEqual(call.kwargs['feature_reference'], 'ce_missing_existing')
-                            self.assertEqual(call.kwargs['mode'], 'cosine')
-                        messages = [call.args[0] for call in logger.info.call_args_list]
-                        self.assertTrue(any('mode=dynamic_b' in text and 'existing_gate=' in text
-                                            and 'feature_gate=' in text and 'effective_distill=' in text
-                                            for text in messages))
-            self.assertEqual(len(list(Path(output).glob('*.pt'))), 2)
-            self.assertEqual(len(list(Path(output).glob('acc_*.csv'))), 2)
-            for path, digest in fixed_hashes.items():
-                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
-            metrics = [json.loads(path.read_text('utf-8')) for path in Path(output).glob('*_metrics.json')]
-            self.assertEqual({item['distillation_mode'] for item in metrics}, {'fixed', 'dynamic_b'})
+        with tempfile.TemporaryDirectory(prefix='.test_dynamic_b_', dir=Path(__file__).resolve().parent) as output:
+            args = parse_args(['-gpu', '-1', '-np', '1', '-frac', '1', '-b', '2', '-T', '2',
+                               '-global_epochs', '1', '-local_epochs', '2', '-result_dir', output])
+            logger = Mock()
+            with patch.multiple(trainer, Logger=Mock(return_value=logger),
+                                load_data=Mock(return_value=(images, labels, images, labels)),
+                                partition_data=Mock(return_value={0: [0, 1]}),
+                                get_dataloader=Mock(return_value=(None, None, dataset, dataset)),
+                                compute_accuracy=Mock(return_value=.5)), \
+                 patch('models.kd_weighting.stsat_distillation_loss', wraps=stsat_distillation_loss) as kd_call:
+                trainer.run(args)
+            self.assertEqual(kd_call.call_count, 2)
+            messages = [call.args[0] for call in logger.info.call_args_list]
+            self.assertTrue(any('mode=dynamic_b' in text and 'existing_gate=' in text
+                                and 'feature_gate=' in text and 'effective_distill=' in text
+                                for text in messages))
+            checkpoint, = Path(output).glob('*.pt')
+            self.assertIn('_dynamic_b', checkpoint.name)
+            self.assertEqual(len(list(Path(output).glob('acc_*.csv'))), 1)
+            metrics_path, = Path(output).glob('*_metrics.json')
+            metrics = json.loads(metrics_path.read_text('utf-8'))
+            self.assertEqual(metrics['distillation_mode'], 'dynamic_b')
+            self.assertEqual(metrics['best_global_accuracy'], .5)
+            self.assertEqual(metrics['num_clients_evaluated'], 1)
+            state = torch.load(checkpoint, map_location='cpu', weights_only=True)
+            self.assertTrue(all(torch.isfinite(value).all() for value in state.values()))
 
-    def test_dynamic_logs_do_not_overwrite_fixed_logs(self):
+    def test_logs_use_dynamic_b_directory(self):
         from utils import Logger
 
-        with tempfile.TemporaryDirectory(prefix='st_sat_mode_logs_') as output:
+        with tempfile.TemporaryDirectory(prefix='.test_dynamic_logs_', dir=Path(__file__).resolve().parent) as output:
             for simple in (False, True):
-                fixed = parse_args(['-log_dir', output] + (['-simple_log'] if simple else []))
-                dynamic = parse_args(['-log_dir', output, '-st_distill_mode', 'dynamic_b']
-                                     + (['-simple_log'] if simple else []))
-                fixed_path = Path(Logger(fixed).filename)
-                before = fixed_path.read_bytes()
-                dynamic_path = Path(Logger(dynamic).filename)
-                self.assertNotEqual(fixed_path, dynamic_path)
-                self.assertIn('dynamic_b', dynamic_path.parts)
-                self.assertEqual(fixed_path.read_bytes(), before)
+                args = parse_args(['-log_dir', output] + (['-simple_log'] if simple else []))
+                log_path = Path(Logger(args).filename)
+                self.assertIn('dynamic_b', log_path.parts)
+                self.assertIn("st_distill_mode='dynamic_b'", log_path.read_text('utf-8'))
 
 
 if __name__ == '__main__':

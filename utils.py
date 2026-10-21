@@ -47,9 +47,7 @@ def get_local_time():
 class Logger:
 
     def __init__(self, args, desc='fl'):
-        log_root = args.log_dir
-        if getattr(args, 'st_distill_mode', 'fixed') == 'dynamic_b':
-            log_root = os.path.join(log_root, 'dynamic_b')
+        log_root = os.path.join(args.log_dir, 'dynamic_b')
         if getattr(args, 'simple_log', False):
             ensure_dir(log_root)
             index = 1
