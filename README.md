@@ -18,8 +18,8 @@ spikingjelly==0.0.0.0.14
 
 ## Dynamic B Distillation
 
-ST-SAT uses dynamic B as its only distillation strategy. It runs by default;
-`-st_distill_mode dynamic_b` and `--st-distill-mode dynamic_b` remain accepted.
+ST-SAT directly uses dynamic B. No distillation-mode selector or KD
+coefficient arguments are required.
 
 ```text
 existing_gate = stop_gradient(clamp(cos(grad(CE), grad(ExistingKL)), 0, 1))
@@ -33,12 +33,12 @@ reference excludes regularization and feature MSE; the composite cosine is
 used directly. The core strategy follows the original B implementation in
 `B_KD_4GPU_linux_20261017`, with alternative modes removed.
 
-`lamda`, `st_no_exist_label_weight`, `st_exist_label_weight` and
-`st_lambda_feature` are enable switches: zero disables the term; any positive
-value enables it without an extra multiplier. `lamda` controls both class KL
-terms, while feature KD is enabled independently. Missing KL has coefficient
-1 when enabled. KL uses the full-class softmax, feature MSE uses firing rates,
-and the teacher stays in evaluation mode.
+All available distillation terms are included. CE and missing-class KL have
+coefficient 1; existing-class KL and feature MSE are weighted only by their
+detached dynamic gates. An empty class subset or absent feature contributes
+zero. KL uses the full-class softmax, feature MSE uses firing rates, and the
+teacher stays in evaluation mode. Neuron regularization coefficients remain
+separate from distillation.
 
 ```bash
 python main.py -data_dir PATH_TO_CIFAR10

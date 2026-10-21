@@ -27,18 +27,20 @@ class DynamicBDistillationTests(unittest.TestCase):
         kl = torch.stack((3 * p[0] + 4 * p[1], 4 * p[1])).unsqueeze(0)
         return p, ce, kl, p[1]
 
-    def b_loss(self, ce, kl, feature, parameters, coefficients=(.1, 1., .3, .1)):
+    def b_loss(self, ce, kl, feature, parameters):
         return stsat_distillation_loss(
-            ce, kl, torch.tensor([1]), torch.tensor([0]), feature, parameters,
-            *coefficients)
+            ce, kl, torch.tensor([1]), torch.tensor([0]), feature, parameters)
 
-    def test_dynamic_b_is_the_only_mode_and_default(self):
-        self.assertEqual(parse_args([]).st_distill_mode, 'dynamic_b')
-        self.assertEqual(parse_args(['-st_distill_mode', 'dynamic_b']).st_distill_mode, 'dynamic_b')
-        self.assertEqual(parse_args(['--st-distill-mode', 'dynamic_b']).st_distill_mode, 'dynamic_b')
-        for mode in ('fixed', 'invalid'):
-            with self.subTest(mode=mode), patch('sys.stderr'), self.assertRaises(SystemExit):
-                parse_args(['-st_distill_mode', mode])
+    def test_legacy_distillation_options_are_removed(self):
+        args = parse_args([])
+        for flag in ('-lamda', '-st_no_exist_label_weight', '-st_exist_label_weight', '-st_lambda_feature'):
+            self.assertFalse(hasattr(args, flag[1:]))
+            with self.subTest(flag=flag), patch('sys.stderr'), self.assertRaises(SystemExit):
+                parse_args([flag, '0.1'])
+        self.assertFalse(hasattr(args, 'st_distill_mode'))
+        for flag in ('-st_distill_mode', '--st-distill-mode'):
+            with self.subTest(flag=flag), patch('sys.stderr'), self.assertRaises(SystemExit):
+                parse_args([flag, 'dynamic_b'])
 
     def test_feature_uses_composite_reference_without_ce_minimum_or_regularization(self):
         p, ce, kl, feature = self.linear_losses()
@@ -61,7 +63,7 @@ class DynamicBDistillationTests(unittest.TestCase):
         kl = F.kl_div(p.log_softmax(1), teacher, reduction='none')
         feature = (p[:, :2] - .2).square().mean()
         kd, gates = stsat_distillation_loss(
-            ce, kl, torch.tensor([2]), torch.tensor([0, 1]), feature, [p], .1, 1., .3, .1)
+            ce, kl, torch.tensor([2]), torch.tensor([0, 1]), feature, [p])
         grad = lambda loss: torch.autograd.grad(loss, p, retain_graph=True)[0]
         expected = (grad(ce) + grad(kl[:, 2].mean())
                     + gates['existing'] * grad(kl[:, :2].sum(1).mean())
@@ -70,27 +72,19 @@ class DynamicBDistillationTests(unittest.TestCase):
         (ce + kd).backward()
         torch.testing.assert_close(p.grad, expected, atol=1e-12, rtol=1e-12)
 
-    def test_positive_coefficients_are_only_enable_switches(self):
+    def test_empty_classes_and_absent_features_skip_gradient_probes(self):
         p, ce, kl, feature = self.linear_losses()
-        low, low_gates = self.b_loss(ce, kl, feature, [p])
-        high, high_gates = self.b_loss(ce, kl, feature, [p], coefficients=(5., 7., 9., 11.))
-        torch.testing.assert_close(low, high, rtol=0, atol=0)
-        for name in low_gates:
-            torch.testing.assert_close(low_gates[name], high_gates[name], rtol=0, atol=0)
-
-    def test_disabled_or_empty_terms_skip_probes_and_missing_remains_unit_weight(self):
-        p, ce, kl, feature = self.linear_losses()
+        empty = torch.tensor([], dtype=torch.long)
         with patch('torch.autograd.grad', side_effect=AssertionError('Unexpected probe')):
-            kd, gates = self.b_loss(ce, kl, feature, [p], coefficients=(.1, .2, 0., 0.))
+            missing_only, gates = stsat_distillation_loss(
+                ce, kl, torch.tensor([1]), empty, None, [p])
             empty_kd, empty_gates = stsat_distillation_loss(
-                ce, kl, torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), None,
-                [p], .1, 1., .3, .1)
-        torch.testing.assert_close(kd, kl[:, 1].mean(), rtol=0, atol=0)
+                ce, kl, empty, empty, None, [p])
+        torch.testing.assert_close(missing_only, kl[:, 1].mean(), rtol=0, atol=0)
         self.assertTrue(all(gate.item() == 0. for gate in gates.values()))
         self.assertEqual(empty_kd.item(), 0.)
         self.assertTrue(all(gate.item() == 0. for gate in empty_gates.values()))
-        # Feature KD does not depend on lamda when both class KL terms are off.
-        feature_only, gates = self.b_loss(ce, kl, p[0], [p], coefficients=(0., 1., .3, .1))
+        feature_only, gates = stsat_distillation_loss(ce, kl, empty, empty, p[0], [p])
         torch.testing.assert_close(feature_only, p[0])
         self.assertEqual(gates['existing'].item(), 0.)
         self.assertEqual(gates['feature'].item(), 1.)
@@ -108,12 +102,6 @@ class DynamicBDistillationTests(unittest.TestCase):
         self.assertIsNone(shared.grad)
         gates = ce_aligned_kd_weights(shared * 0, {'existing': shared}, [shared])
         self.assertEqual(gates['existing'].item(), 0.)
-
-    def test_parser_rejects_negative_and_nonfinite_kd_enable_values(self):
-        for flag in ('-lamda', '-st_no_exist_label_weight', '-st_exist_label_weight', '-st_lambda_feature'):
-            for value in ('-1', 'nan', 'inf'):
-                with self.subTest(flag=flag, value=value), patch('sys.stderr'), self.assertRaises(SystemExit):
-                    parse_args([flag, value])
 
     def test_default_training_runs_dynamic_b_and_saves_results(self):
         import trainer
@@ -156,7 +144,6 @@ class DynamicBDistillationTests(unittest.TestCase):
                 args = parse_args(['-log_dir', output] + (['-simple_log'] if simple else []))
                 log_path = Path(Logger(args).filename)
                 self.assertIn('dynamic_b', log_path.parts)
-                self.assertIn("st_distill_mode='dynamic_b'", log_path.read_text('utf-8'))
 
 
 if __name__ == '__main__':

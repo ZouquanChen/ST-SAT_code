@@ -86,7 +86,7 @@ def run(args):
     global_model.to(device)
     logger.info('=' * 80)
     logger.info('ST-SATH (Spatio-Temporal PLIF) Configuration with Enhanced Knowledge Distillation:')
-    logger.info(f'[ST-SATH Distillation] mode={args.st_distill_mode}')
+    logger.info('[ST-SATH Distillation] mode=dynamic_b')
     max_acc = -1.0
     best_epoch = 0
     client_best_acc = {i: -1.0 for i in range(args.n_parties)}
@@ -177,8 +177,7 @@ def run(args):
                         l_feature = torch.tensor(0.0, device=device)
                     kd_loss, kd_weights = stsat_distillation_loss(
                         ce_loss, kl_per_class, no_exist_label, exist_label, l_feature,
-                        kd_parameters, args.lamda, args.st_no_exist_label_weight,
-                        args.st_exist_label_weight, args.st_lambda_feature,
+                        kd_parameters,
                     )
                     loss = ce_loss + reg_loss + kd_loss
                     loss.backward()
@@ -290,7 +289,7 @@ def run(args):
     best_epoch_value = int(best_epoch)
     metrics_path = checkpoint_path[:-3] + '_metrics.json'
     with open(metrics_path, 'w', encoding='utf-8') as metrics_file:
-        json.dump({'strategy': args.strategy, 'distillation_mode': args.st_distill_mode, 'dataset': args.dataset, 'model': args.model, 'alpha': args.alpha, 'seed': args.init_seed, 'run_tag': run_tag, 'best_global_accuracy': best_acc_value, 'best_global_epoch': best_epoch_value, 'global_test_samples': len(test_ds_global), 'global_test_policy': 'single_clean', **client_best_summary}, metrics_file, indent=2, ensure_ascii=False)
+        json.dump({'strategy': args.strategy, 'distillation_mode': 'dynamic_b', 'dataset': args.dataset, 'model': args.model, 'alpha': args.alpha, 'seed': args.init_seed, 'run_tag': run_tag, 'best_global_accuracy': best_acc_value, 'best_global_epoch': best_epoch_value, 'global_test_samples': len(test_ds_global), 'global_test_policy': 'single_clean', **client_best_summary}, metrics_file, indent=2, ensure_ascii=False)
     logger.info(f"[{args.strategy}] Average best client accuracy: {client_best_summary['average_best_client_accuracy']} ({client_best_summary['num_clients_evaluated']} clients)")
     logger.info(f'Best global checkpoint saved to: {checkpoint_path}')
     logger.info(f'Metrics saved to: {metrics_path}')

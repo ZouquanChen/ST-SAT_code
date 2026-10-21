@@ -1,6 +1,4 @@
 """CE-referenced, detached cosine gates for ST-SATH distillation."""
-import math
-
 import torch
 
 
@@ -50,30 +48,26 @@ def ce_aligned_kd_weights(ce_loss, objectives, parameters):
 
 
 def stsat_distillation_loss(ce_loss, kl_per_class, missing, existing, feature,
-                            parameters, kd_weight, missing_weight, existing_weight,
-                            feature_weight):
+                            parameters):
     """Original dynamic B: unit missing KL and detached existing/feature gates.
 
-    Positive legacy KD arguments enable terms; zero disables them. They do
-    not multiply losses. Both KL terms use the full-class softmax. Existing
+    All available KD terms participate, with no coefficient arguments or
+    enable switches. Both KL terms use the full-class softmax. Existing
     KL is gated against pure CE. Feature MSE is gated against CE + missing KL
     + detached-existing-gate * existing KL, excluding regularization and the
     feature term itself. The caller adds regularization exactly once.
     """
     parameters = tuple(parameters)
-    coefficients = (kd_weight, missing_weight, existing_weight, feature_weight)
-    if any(not math.isfinite(value) or value < 0 for value in coefficients):
-        raise ValueError('KD enable values must be finite and nonnegative')
     loss = ce_loss.new_zeros(())
     weights = {'existing': ce_loss.new_zeros(()), 'feature': ce_loss.new_zeros(())}
-    if kd_weight > 0 and missing_weight > 0 and missing.numel():
+    if missing.numel():
         loss = loss + kl_per_class[:, missing.long()].sum(1).mean()
-    if kd_weight > 0 and existing_weight > 0 and existing.numel():
+    if existing.numel():
         existing_loss = kl_per_class[:, existing.long()].sum(1).mean()
         weights['existing'] = ce_aligned_kd_weights(
             ce_loss, {'existing': existing_loss}, parameters)['existing']
         loss = loss + weights['existing'] * existing_loss
-    if feature_weight > 0 and feature is not None and feature.requires_grad:
+    if feature is not None and feature.requires_grad:
         reference = ce_loss + loss
         weights['feature'] = ce_aligned_kd_weights(
             reference, {'feature': feature}, parameters)['feature']

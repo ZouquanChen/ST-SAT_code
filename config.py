@@ -1,5 +1,4 @@
 import argparse
-import math
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='ST-SAT federated training with spiking VGG only')
@@ -24,9 +23,6 @@ def parse_args(argv=None):
     parser.add_argument('-frac', type=float, default=0.2, help='Sample ratio [0., 1.] of parties for each local training round')
     parser.add_argument('-global_epochs', type=int, default=50, help='rounds of updating global model')
     parser.add_argument('-local_epochs', type=int, default=10, help='number of local training rounds')
-    parser.add_argument('-st_distill_mode', '--st-distill-mode', choices=('dynamic_b',), default='dynamic_b',
-                        help='ST-SAT uses dynamic_b exclusively; positive KD values enable terms and zero disables them')
-    parser.add_argument('-lamda', type=float, default=0.1, help='Positive enables class KD; zero disables both class KL terms')
     parser.add_argument('-st_decay', type=float, default=0.25, help='ST-SAT: Initial leaky decay factor for membrane potential (0-1)')
     parser.add_argument('-st_learnable_decay', action='store_true', default=True, help='ST-SAT: Enable learnable decay factor per channel (PLIF)')
     parser.add_argument('-no_st_learnable_decay', action='store_false', dest='st_learnable_decay', help='ST-SAT: Disable learnable decay, use fixed decay value')
@@ -37,9 +33,6 @@ def parse_args(argv=None):
     parser.add_argument('-st_lambda_temporal', type=float, default=0.01, help='ST-SAT: Regularization coefficient for temporal factor')
     parser.add_argument('-st_lambda_nam', type=float, default=0.001, help='ST-SAT: Regularization coefficient for NAM weights')
     parser.add_argument('-st_survival_threshold', type=float, default=0.001, help='ST-SAT: Activity cutoff for survival statistics only; no pruning or masked aggregation')
-    parser.add_argument('-st_lambda_feature', type=float, default=0.1, help='Positive enables dynamic B feature KD; zero disables it')
-    parser.add_argument('-st_exist_label_weight', type=float, default=0.3, help='Positive enables gated existing-class KD; zero disables it')
-    parser.add_argument('-st_no_exist_label_weight', type=float, default=1.0, help='Positive enables unit-weight missing-class KD; zero disables it')
     parser.add_argument('-st_temporal_momentum', type=float, default=1.0, help='ST-SAT: Server temporal interpolation weight (0=keep old server value, 1=client weighted average); no persistent local parameters')
     parser.add_argument('-st_decay_momentum', type=float, default=1.0, help='ST-SAT: Server tau interpolation weight (0=keep old server value, 1=client weighted average); interpolation is in tau/logit space')
     parser.add_argument('-st_use_ltf', action='store_true', default=True, help='ST-SAT: Enable Learnable Temporal Factor (LTF)')
@@ -63,8 +56,5 @@ def parse_args(argv=None):
         parser.error('st_decay must be between 0 and 1')
     if not all((0 <= m <= 1 for m in (args.st_temporal_momentum, args.st_decay_momentum))):
         parser.error('Aggregation momenta must be in [0, 1]')
-    if any(not math.isfinite(value) or value < 0 for value in
-           (args.lamda, args.st_no_exist_label_weight, args.st_exist_label_weight, args.st_lambda_feature)):
-        parser.error('KD coefficients must be finite and nonnegative')
     args.snn = True
     return args
