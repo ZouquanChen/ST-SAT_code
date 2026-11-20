@@ -30,6 +30,10 @@ def summarize_client_best_accuracy(client_best_accuracy):
 
 def run(args):
     from models.kd_weighting import stsat_distillation_loss
+    from precision import configure_fp32
+    configure_fp32()
+    if torch.is_autocast_enabled():
+        raise RuntimeError('Disable CUDA autocast for FP32 training')
     args.num_classes = CLASS_NUM[args.dataset]
     args.device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
     if args.device.type != 'cpu':
