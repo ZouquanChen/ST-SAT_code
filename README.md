@@ -1,20 +1,8 @@
 # ST-SAT
 
-This repository contains the official PyTorch implementation of:
+This repository contains the PyTorch implementation of:
 
 **Decoupling Label Shift and Surrogate Gradient Errors for Robust Federated Spiking Neural Networks**
-
-## Python Dependencies
-
-The following package versions were installed in the server environment:
-
-```text
-torch==2.0.1+cu118
-torchvision==0.15.2+cu118
-numpy==1.23.5
-pandas==1.5.3
-spikingjelly==0.0.0.0.14
-```
 
 ## Acknowledgements
 
